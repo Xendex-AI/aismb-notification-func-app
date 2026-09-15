@@ -1,0 +1,4 @@
+# Standalone notification function app (WhatsApp send-only)
+azure-functions
+psycopg2-binary
+httpx

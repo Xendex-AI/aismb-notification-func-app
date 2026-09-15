@@ -1,0 +1,10 @@
+bin
+obj
+.vs
+local.settings.json
+.env
+.venv
+__pycache__
+*.py[cod]
+.python_packages
+notification-func-app.code-workspace
