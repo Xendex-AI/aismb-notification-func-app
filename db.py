@@ -1,24 +1,19 @@
-"""Database access for the appointment-reminder function app.
+"""Database access for the notification function app.
 
-Reads WAITING tokens whose estimated consultation time falls inside the
-reminder window, and records which reminders have already been forwarded so
-each appointment is reminded exactly once. Pure polling — no WhatsApp, no LLM.
+Two reminder types, both using pre-existing tables (no new tables):
+
+1. Slot-based appointments:
+   Data:  appointments + slots + patients + doctors
+   Dedup: appointment_reminder_records  (patient_id + reminder_date)
+
+2. Follow-up reminders:
+   Data:  followup_offers + patients + doctors
+   Dedup: post_visit_reminder_records   (patient_id + encounter_id)
 """
 import os
 
 import psycopg2
 import psycopg2.extras
-
-DEDUP_TABLE = "appointment_reminders"
-
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS appointment_reminders (
-    hospital_id  TEXT         NOT NULL,
-    token_id     UUID         NOT NULL,
-    reminded_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (hospital_id, token_id)
-)
-"""
 
 
 def get_connection():
@@ -31,67 +26,143 @@ def get_connection():
     )
 
 
-def ensure_dedup_table(conn) -> None:
-    """Create the reminder bookkeeping table if it does not exist yet."""
-    with conn.cursor() as cur:
-        cur.execute(_SCHEMA)
-    conn.commit()
+# ---------------------------------------------------------------------------
+# Slot-based appointment reminders
+# ---------------------------------------------------------------------------
+
+_SLOT_QUERY = """
+    SELECT
+        a.appointment_id,
+        a.hospital_id,
+        a.department,
+        a.appointment_date,
+        s.start_time,
+        s.end_time,
+        p.name                AS patient_name,
+        p.phone               AS patient_phone,
+        p.requested_by_phone  AS requester_phone,
+        p.relation_to_requester,
+        d.name                AS doctor_name,
+        CASE
+            WHEN p.relation_to_requester = 'self' THEN p.phone
+            ELSE p.requested_by_phone
+        END AS send_to_phone
+    FROM appointments a
+    JOIN slots s     ON s.slot_id     = a.slot_id
+    JOIN patients p  ON p.patient_id  = a.patient_id
+    JOIN doctors d   ON d.doctor_id   = a.doctor_id
+                  AND d.hospital_id  = a.hospital_id
+    WHERE a.status = 'SCHEDULED'
+      AND a.appointment_date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '1 day'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM appointment_reminder_records r
+          WHERE r.patient_id    = a.patient_id
+            AND r.reminder_date = a.appointment_date
+            AND r.status        = 'SENT'
+      )
+    ORDER BY a.appointment_date, s.start_time
+"""
 
 
-def fetch_due_appointments(conn, window_minutes: int, lead_minutes: int):
-    """Return WAITING tokens whose estimated consultation time is within the
-    next `window_minutes` (and at least `lead_minutes` ahead), excluding those
-    already reminded.
-
-    Estimated consultation time per token:
-        COALESCE(ds.started_at, ds.date + avg_checkin_time)
-            + (token_number - 1) * avg_consultation_minutes
-    """
-    sql = f"""
-        WITH queue AS (
-            SELECT
-                t.token_id,
-                t.hospital_id,
-                t.token_number,
-                t.department,
-                p.name                AS patient_name,
-                p.relation_to_requester,
-                p.requested_by_phone  AS patient_phone,
-                d.name                AS doctor_name,
-                ds.date,
-                COALESCE(ds.started_at, ds.date::timestamp + d.avg_checkin_time)
-                    + ((t.token_number - 1) * d.avg_consultation_minutes
-                       * INTERVAL '1 minute')          AS est_consultation_at
-            FROM tokens t
-            JOIN patients p          ON p.patient_id  = t.patient_id
-            JOIN doctors d           ON d.doctor_id   = t.doctor_id
-            JOIN doctor_sessions ds  ON ds.session_id = t.session_id
-            LEFT JOIN {DEDUP_TABLE} r
-                   ON r.hospital_id = t.hospital_id AND r.token_id = t.token_id
-            WHERE t.status = 'WAITING'
-              AND r.token_id IS NULL
-        )
-        SELECT *
-        FROM queue
-        WHERE est_consultation_at BETWEEN
-                  NOW() + (%s * INTERVAL '1 minute')
-              AND NOW() + (%s * INTERVAL '1 minute')
-        ORDER BY est_consultation_at ASC
-    """
+def fetch_slot_reminders(conn):
+    """Return SCHEDULED slot-based appointments needing a reminder today/tomorrow."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, (lead_minutes, window_minutes))
-        return cur.fetchall()
+        cur.execute(_SLOT_QUERY)
+        rows = cur.fetchall()
+    _normalize_phones(rows)
+    return rows
 
 
-def mark_reminded(conn, hospital_id: str, token_id: str) -> None:
-    """Record a reminder as forwarded (idempotent on conflict)."""
+def mark_slot_reminded(conn, patient_id, reminder_date) -> None:
+    """Record that a slot-based reminder was sent (idempotent)."""
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            INSERT INTO {DEDUP_TABLE} (hospital_id, token_id)
-            VALUES (%s, %s)
-            ON CONFLICT (hospital_id, token_id) DO NOTHING
+            """
+            INSERT INTO appointment_reminder_records
+                (reminder_id, hospital_id, token_id, patient_id,
+                 reminder_date, triggered_at, status, fired_at)
+            VALUES (
+                gen_random_uuid(), '', '00000000-0000-0000-0000-000000000000',
+                %s, %s, NOW(), 'SENT', NOW()
+            )
+            ON CONFLICT DO NOTHING
             """,
-            (str(hospital_id), str(token_id)),
+            (str(patient_id), reminder_date),
         )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Follow-up reminders
+# ---------------------------------------------------------------------------
+
+_FOLLOWUP_QUERY = """
+    SELECT
+        f.offer_id,
+        f.hospital_id,
+        f.department,
+        f.patient_id,
+        p.name                AS patient_name,
+        p.phone               AS patient_phone,
+        p.requested_by_phone  AS requester_phone,
+        p.relation_to_requester,
+        d.name                AS doctor_name,
+        CASE
+            WHEN p.relation_to_requester = 'self' THEN p.phone
+            ELSE p.requested_by_phone
+        END AS send_to_phone
+    FROM followup_offers f
+    JOIN patients p  ON p.patient_id  = f.patient_id
+    JOIN doctors d   ON d.doctor_id   = f.doctor_id
+                  AND d.hospital_id  = f.hospital_id
+    WHERE f.status = 'PENDING'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM post_visit_reminder_records r
+          WHERE r.patient_id    = f.patient_id
+            AND r.encounter_id  = f.encounter_id
+            AND r.status        = 'SENT'
+      )
+    ORDER BY f.created_at
+"""
+
+
+def fetch_followup_reminders(conn):
+    """Return PENDING follow-up offers needing a reminder."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(_FOLLOWUP_QUERY)
+        rows = cur.fetchall()
+    _normalize_phones(rows)
+    return rows
+
+
+def mark_followup_reminded(conn, patient_id, encounter_id) -> None:
+    """Record that a follow-up reminder was sent (idempotent)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO post_visit_reminder_records
+                (reminder_id, encounter_id, patient_id, hospital_id,
+                 triggered_at, status, fired_at)
+            VALUES (
+                gen_random_uuid(), %s, %s, '', NOW(), 'SENT', NOW()
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            (str(encounter_id), str(patient_id)),
+        )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_phones(rows) -> None:
+    """Ensure every send_to_phone is 12-digit (91XXXXXXXXXX)."""
+    for row in rows:
+        phone = (row.get("send_to_phone") or "").strip()
+        if len(phone) == 10:
+            phone = "91" + phone
+        row["send_to_phone_normalized"] = phone
