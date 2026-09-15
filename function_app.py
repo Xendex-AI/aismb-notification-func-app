@@ -56,12 +56,12 @@ def _format_reminder(row: dict) -> str:
     return "\n".join(lines)
 
 
-@app.route(route="test-send", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@app.route(route="test-send", methods=["POST"], auth_level=func.AuthLevel.FUNCTION)
 def test_send(req: func.HttpRequest) -> func.HttpResponse:
     """TEST ONLY — send a WhatsApp message to a real number.
 
     Body: {"to": "<phone>", "text": "<optional message>"}
-    No auth required (anonymous) for easy testing.
+    Requires the host-key or function-key (X-Functions-Key header or ?code= query param).
     Remove this endpoint before production use.
     """
     try:
