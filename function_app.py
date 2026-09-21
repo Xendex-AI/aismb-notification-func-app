@@ -33,8 +33,8 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 logger = logging.getLogger(__name__)
 
 SLOT_TEMPLATE     = os.getenv("SLOT_TEMPLATE_NAME", "appointment_reminder")
-FOLLOWUP_TEMPLATE = os.getenv("FOLLOWUP_TEMPLATE_NAME", "followup_reminder")
-TEMPLATE_LANG     = os.getenv("TEMPLATE_LANG", "en")
+FOLLOWUP_TEMPLATE = os.getenv("FOLLOWUP_TEMPLATE_NAME", "follow_up_reminder")
+TEMPLATE_LANG     = os.getenv("TEMPLATE_LANG", "en_US")
 
 
 # ---------------------------------------------------------------------------
